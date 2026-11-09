@@ -155,6 +155,13 @@ namespace VDES
 
     void RecordFlowResults(std::string file_name);
 
+    int NodeCount() { return m_nodes.size(); }
+    // The device array `send_tcp_packets` writes each node's plan completion into.
+    uint8_t *NodeCompletionFlags() { return m_tcp_controller.GetCompletedArr(); }
+    // The device copies the kernels read and write, node-major by MAX_TCP_CONNECTION_NUM.
+    std::vector<VDES::TCPConnection *> &DeviceConnections() { return m_tcp_connections; }
+    int64_t *TimeslotEndDevice() { return m_timeslot_end_gpu; }
+
     void BuildTopology();
 #if ENABLE_HUGE_GRAPH
     void BuildHugeGraph();

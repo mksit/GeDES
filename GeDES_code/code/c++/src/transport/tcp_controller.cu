@@ -140,8 +140,11 @@ __device__ void update_cwnd(VDES::TCPConnection *con, int64_t timeslot_end)
 
 __device__ void fill_ack_packet(VDES::TCPConnection *con, VDES::TCPPacket *ack_packet, int64_t *timestamp)
 {
-    memcpy(ack_packet->src_port, &con->src_port, 2);
-    memcpy(ack_packet->dst_port, &con->dst_port, 2);
+    // `get_tcp_connection_id` reads a packet's ports in the receiver's own orientation, which
+    // is what `fill_tcp_packets` writes. An acknowledgement left them in the sender's, and the
+    // two agree only while every node's port offset is the same — one connection a node.
+    memcpy(ack_packet->src_port, &con->dst_port, 2);
+    memcpy(ack_packet->dst_port, &con->src_port, 2);
     memcpy(ack_packet->src_ip, &con->src_ip, 4);
     memcpy(ack_packet->dst_ip, &con->dst_ip, 4);
     memcpy(ack_packet->acknowledgement_number, &con->expected_seq, 4);
@@ -179,7 +182,12 @@ __device__ void handle_ack_packets(GPUQueue<VDES::TCPPacket *> *recv_queue, int 
                 con->snd = ack;
                 con->una = max(con->una, ack);
 
-                if (con->acked_bytes >= con->flows->queue[con->acked_flows].byte_offset)
+                // `acked_flows` indexes the flow array directly, and `head` counts the flows
+                // the send kernel has taken off it. Without the guard a late acknowledgement
+                // on a connection whose flows are all acked closes the record after the last
+                // one, and walks off the end of the array once it has done so a hundred times.
+                if (con->acked_flows < con->flows->head &&
+                    con->acked_bytes >= con->flows->queue[con->acked_flows].byte_offset)
                 {
 
                     int64_t timestamp_end;
@@ -213,26 +221,82 @@ __device__ void handle_ack_packets(GPUQueue<VDES::TCPPacket *> *recv_queue, int 
     }
 }
 
+__device__ void insert_receive_record(VDES::TCPConnection *con, uint32_t seq, uint32_t seq_end)
+{
+    VDES::RecvPacketRecord *record = con->records;
+    VDES::RecvPacketRecord *last = NULL;
+    while (record != NULL)
+    {
+        if (seq_end < record->start_id)
+        {
+            break;
+        }
+        if (seq_end == record->start_id)
+        {
+            record->start_id = seq;
+            return;
+        }
+        if (seq >= record->start_id && seq_end <= record->end_id)
+        {
+            return;
+        }
+        if (seq == record->end_id)
+        {
+            record->end_id = seq_end;
+            return;
+        }
+        last = record;
+        record = record->next;
+    }
+
+    if (con->records_pool->size <= 0)
+    {
+        return;
+    }
+    VDES::RecvPacketRecord *cur = con->records_pool->get_head();
+    cur->start_id = seq;
+    cur->end_id = seq_end;
+    cur->next = record;
+    if (last == NULL)
+    {
+        con->records = cur;
+    }
+    else
+    {
+        last->next = cur;
+    }
+    con->record_num++;
+}
+
+/**
+ * @brief: The shipped body credits every arriving segment to connection 0, which is what
+ * "only 1 connection per node" allows. An explicit peer map needs each segment's own
+ * connection, which is the same lookup the acknowledgement path already does.
+ */
 __device__ int handle_non_ack_packets(GPUQueue<VDES::TCPPacket *> *recv_queue, int ack_num, VDES::TCPConnection **cons, int con_num)
 {
     int packet_num = recv_queue->size;
-
-    VDES::TCPConnection *con = cons[0];
-    VDES::RecvPacketRecord *record = con->records;
     int expired_packet_num = 0;
 
-    VDES::RecvPacketRecord *last = NULL;
     for (int i = ack_num; i < packet_num; i++)
     {
-        uint32_t seq;
         VDES::TCPPacket *p = recv_queue->get_element(i);
+        int tcp_id = get_tcp_connection_id(p, cons, con_num);
+        if (tcp_id < 0)
+        {
+            continue;
+        }
 
+        VDES::TCPConnection *con = cons[tcp_id];
+        uint32_t seq;
         memcpy(&seq, p->sequence_number, 4);
-        uint32_t seq_end = seq + 1460;
 
         if (seq < con->expected_seq)
         {
             expired_packet_num++;
+            // A retransmission of bytes this connection already holds: its acknowledgement
+            // was the thing that went missing, so one is owed again.
+            con->repeat_non_ack_num = con->packets_num_per_ack;
             continue;
         }
 
@@ -243,155 +307,25 @@ __device__ int handle_non_ack_packets(GPUQueue<VDES::TCPPacket *> *recv_queue, i
         }
 #endif
 
-        if (record != NULL || last != NULL)
-        {
-
-            while (record != NULL)
-            {
-                if (seq_end < record->start_id)
-                {
-                    if (con->records_pool->size <= 0)
-                    {
-                        break;
-                    }
-
-                    VDES::RecvPacketRecord *cur = con->records_pool->get_head();
-                    cur->start_id = seq;
-                    cur->end_id = seq_end;
-
-                    if (last == NULL)
-                    {
-                        cur->next = con->records;
-                        con->records = cur;
-                    }
-                    else
-                    {
-                        cur->next = last->next;
-                        last->next = cur;
-                    }
-                    con->record_num++;
-                    record = cur;
-                    break;
-                }
-                else if (seq_end == record->start_id)
-                {
-                    record->start_id = seq;
-                    break;
-                }
-                else if (seq_end <= record->end_id)
-                {
-                    break;
-                }
-                else if (seq == record->end_id)
-                {
-                    record->end_id = seq_end;
-                    break;
-                }
-                last = record;
-                record = record->next;
-            }
-
-            if (record == NULL && con->records_pool->size > 0)
-            {
-                VDES::RecvPacketRecord *cur = con->records_pool->get_head();
-                cur->start_id = seq;
-                cur->end_id = seq_end;
-                cur->next = NULL;
-
-                last->next = cur;
-                record = cur;
-                con->record_num++;
-            }
-        }
-        else
-        {
-            VDES::RecvPacketRecord *cur = con->records_pool->get_head();
-            cur->start_id = seq;
-            cur->end_id = seq_end;
-            cur->next = NULL;
-
-            con->records = cur;
-            record = cur;
-            con->record_num++;
-        }
+        insert_receive_record(con, seq, seq + 1460);
     }
+
     return expired_packet_num;
-
-    // enable for multiple TCP connections
-    // for (int i = ack_num; i < packet_num; i++)
-    // {
-    //     int tcp_id = get_tcp_connection_id(recv_queue->get_element(i), cons, con_num);
-    //     if (tcp_id >= 0)
-    //     {
-    //         VDES::TCPConnection *con = cons[tcp_id];
-    //         uint32_t expected_seq = con->expected_seq;
-    //         uint32_t seq;
-    //         memcpy(&seq, recv_queue->get_element(i)->sequence_number, 4);
-    //         seq += 1460;
-
-    //         VDES::RecvPacketRecord *record = con->records;
-
-    //         bool find = false;
-    //         VDES::RecvPacketRecord *last = NULL;
-    //         while (record != NULL)
-    //         {
-    //             if (seq < record->start_id)
-    //             {
-    //                 VDES::RecvPacketRecord *cur = con->records_pool->get_element(0);
-    //                 con->records_pool->remove_elements(1);
-    //                 cur->start_id = seq - 1460;
-    //                 cur->end_id = seq;
-    //                 if (last != NULL)
-    //                 {
-    //                     cur->next = last->next;
-    //                     last->next = cur;
-    //                 }
-    //                 else
-    //                 {
-    //                     cur->next = con->records;
-    //                     con->records = cur;
-    //                 }
-
-    //                 find = true;
-    //                 con->record_num++;
-    //                 break;
-    //             }
-    //             else if (seq == record->start_id)
-    //             {
-    //                 record->start_id = seq - 1460;
-    //                 find = true;
-    //                 break;
-    //             }
-    //         }
-
-    //         if (!find)
-    //         {
-    //             VDES::RecvPacketRecord *cur = con->records_pool->get_element(0);
-    //             con->records_pool->remove_elements(1);
-    //             cur->start_id = seq - 1460;
-    //             cur->end_id = seq;
-    //             cur->next = NULL;
-    //             con->record_num++;
-
-    //             if (last == NULL)
-    //             {
-    //                 con->records = cur;
-    //             }
-    //             else
-    //             {
-    //                 last->next = cur;
-    //             }
-    //         }
-    //         record = record->next;
-    //     }
-    // }
 }
 
 __device__ int send_ack_packets(VDES::TCPParams *params, int non_ack_num, VDES::TCPConnection **cons, int con_num, VDES::TCPPacket **alloc_packets)
 {
     int ack_response = 0;
+    // A node's timeslot owns this many packet slots and no more (`ipv4_decapsulation.cc`).
+    // With one connection a peer the acknowledgements share that budget, and writing past it
+    // lands in the next node's slots.
+    int budget = MAX_TRANSMITTED_PACKET_NUM + MAX_GENERATED_PACKET_NUM;
     for (int i = 0; i < con_num; i++)
     {
+        if (ack_response + 5 > budget)
+        {
+            break;
+        }
         VDES::TCPConnection *con = cons[i];
         VDES::RecvPacketRecord *record = con->records;
         int64_t expected_num = con->expected_seq;
@@ -431,7 +365,7 @@ __device__ int send_ack_packets(VDES::TCPParams *params, int non_ack_num, VDES::
             for (int j = 0; j < ack_packet_num; j++)
             {
                 con->expected_seq = expected_num - (ack_packet_num - j - 1) * seq_step * 1460;
-                VDES::TCPPacket *ack_packet = alloc_packets[j];
+                VDES::TCPPacket *ack_packet = alloc_packets[ack_response + j];
                 fill_ack_packet(con, ack_packet, params->timeslot_end_time);
 #if ENABLE_DCTCP
                 ack_packet->data_offset_reserved_flags[1] = 0;
@@ -473,12 +407,17 @@ __device__ int send_ack_packets(VDES::TCPParams *params, int non_ack_num, VDES::
             // con->expected_seq = expected_num;
             // ack_response += ack_packet_num;
         }
-        else if (non_ack_num > 0)
+        // The shipped trigger is the node's own arrival count, so with one connection a peer
+        // every quiet connection answers another connection's segment with a duplicate
+        // acknowledgement: the budget above goes to those, and three in a row rewind a
+        // sender that never lost anything. What a duplicate acknowledgement is for is this
+        // connection's own gap, or its own retransmission.
+        else if (con->record_num > 0 || con->repeat_non_ack_num > 0)
         {
             con->repeat_non_ack_num++;
             if (con->repeat_non_ack_num > con->packets_num_per_ack)
             {
-                VDES::TCPPacket *ack_packet = alloc_packets[0];
+                VDES::TCPPacket *ack_packet = alloc_packets[ack_response];
                 fill_ack_packet(con, ack_packet, params->timeslot_end_time);
 #if ENABLE_DCTCP
                 ack_packet->data_offset_reserved_flags[1] = 0;
@@ -573,7 +512,12 @@ __global__ void receive_tcp_packets(VDES::TCPParams *params)
 __device__ int get_queueing_packet_num(VDES::TCPConnection *con)
 {
     uint64_t snd_bytes = con->una - con->snd;
-    int64_t queuing_bytes = min((uint64_t)con->cwnd, con->planned_bytes - con->acked_bytes) - snd_bytes;
+    // The transport sends whole segments, so a plan whose flow is not a whole number of them
+    // is acknowledged past its own size. Unsigned, that subtraction wraps and the connection
+    // sends without end; the flow plan rounds to whole segments and this refuses to wrap.
+    uint64_t remaining_bytes =
+        con->planned_bytes > con->acked_bytes ? con->planned_bytes - con->acked_bytes : 0;
+    int64_t queuing_bytes = min((uint64_t)con->cwnd, remaining_bytes) - snd_bytes;
     queuing_bytes = max(min(queuing_bytes, ((int64_t)con->swnd) - (int64_t)snd_bytes), (int64_t)0);
     int num = (queuing_bytes + con->mss - 1) / con->mss;
     return num;
@@ -639,7 +583,14 @@ __global__ void send_tcp_packets(VDES::TCPParams *params)
             send_packet_num = min(send_packet_num, MAX_TRANSMITTED_PACKET_NUM + MAX_GENERATED_PACKET_NUM - used_packet_num);
             if (send_packet_num <= 0)
             {
-                break;
+                // One idle connection no longer stops the peers behind it in the map: the
+                // slot ends when its packet budget is gone, not at the first quiet peer.
+                if (remaining_capacity <= 0 ||
+                    used_packet_num >= MAX_TRANSMITTED_PACKET_NUM + MAX_GENERATED_PACKET_NUM)
+                {
+                    break;
+                }
+                continue;
             }
 
             // send packets

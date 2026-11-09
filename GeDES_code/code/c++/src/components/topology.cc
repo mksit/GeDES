@@ -1,4 +1,5 @@
 #include "topology.h"
+#include "harness_plan.h"
 #include "vdes_timer.h"
 #include <cuda_runtime.h>
 #include <iostream>
@@ -161,6 +162,11 @@ namespace VDES
 
   void Topology::BuildTCPConnections()
   {
+    if (harness::PlanInstalled())
+    {
+      harness::BuildConnections(m_nodes);
+      return;
+    }
     size_t node_num = m_nodes.size();
     // std::vector<bool> is_visited(node_num, false);
     // for (size_t i = 0; i < node_num; i++)
@@ -1482,6 +1488,11 @@ namespace VDES
 
   void Topology::CreateFlows(int64_t start_timestamp)
   {
+    if (harness::PlanInstalled())
+    {
+      harness::InstallFlows(m_nodes);
+      return;
+    }
     auto poison_inter = [](int64_t avg) -> int64_t
     {
       static std::random_device rd;

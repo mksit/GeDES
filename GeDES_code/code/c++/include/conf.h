@@ -24,7 +24,7 @@
 #define MAX_GENERATED_PACKET_NUM 20   // 20 packets per timeslot
 #define MAX_SWAP_FRAME_NUM 15         // 15 frames per timeslot
 #define TIMESLOT_LENGTH 1000          // ns
-#define MAX_TCP_CONNECTION_NUM 10     // 10 TCP connections per node
+#define MAX_TCP_CONNECTION_NUM 4096   // one connection per peer in the harness's map
 #define DCTCP_K 30                    // the threshold in DCTCP to trigger ECN
 #define DCTCP_G 0.0625
 

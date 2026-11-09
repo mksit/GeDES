@@ -1,4 +1,5 @@
 #include "component.h"
+#include "harness_plan.h"
 #include <iostream>
 #include <cstring>
 #include "protocol_type.h"
@@ -199,7 +200,10 @@ namespace VDES
         // tcp_con->swnd = (NODE_DEFAULT_EGRESS_QUEUE_SIZE / SWND_RATE) * tcp_con->mss;
         tcp_con->swnd = 10000 * tcp_con->mss;
         tcp_con->record_num = 0;
-        tcp_con->flows = create_gpu_queue<Flow>(100);
+        // A chained plan puts every one of a connection's flows in this array: both
+        // `acked_flows` and the send queue's head index it linearly, so it is the plan's
+        // own depth for that connection and not the shipped hundred.
+        tcp_con->flows = create_gpu_queue<Flow>(harness::FlowQueueCapacity());
         tcp_con->records = NULL;
         tcp_con->records_pool = create_gpu_queue<RecvPacketRecord *>(200);
         RecvPacketRecord *records;
